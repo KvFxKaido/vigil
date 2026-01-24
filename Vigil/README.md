@@ -37,12 +37,12 @@ python .\Vigil\app.py C:\dev\sentinel    # Specific project
 ├─────────────────────┤                              │
 │ ● qwen2.5:14b       │       Claude Code            │
 │ [Diff] [Staged]     │                              │
-│ [Commit]            │                              │
+│ [Commit] [Shadow]   │       (or any AI agent)      │
 │ Model output here   │                              │
 └─────────────────────┴──────────────────────────────┘
 ```
 
-Eyes on top (shell output, game state), instruments below (Claude Code).
+The right panes are just a suggestion - Vigil works as a standalone panel for any workflow. The `workspace.cmd` launcher sets up this specific layout with Claude Code, but you can run Vigil on its own.
 
 ## Tabs
 
@@ -83,7 +83,18 @@ It spawns the server fresh for each query (simple but slightly slower). Click an
 
 - `q` — Quit
 - `r` — Refresh file tree
+- `s` — Toggle Shadow review (auto-reviews diffs for security issues)
 - `Enter` — Open selected file in default app (Files tab)
+
+## Shadow Review
+
+Press `s` or click the Shadow button to enable automatic code review. When files change, your local LM Studio model reviews the git diff for:
+
+- Security issues (API keys, credentials, injection vulnerabilities)
+- Obvious bugs or regressions
+- Debug code that should be removed
+
+Status indicator shows: `OK` (safe), `WARN` (issues found), or `CRITICAL` (security problem). Warnings and critical issues auto-display in the output panel.
 
 ## Integration with Windows Terminal
 
@@ -121,7 +132,6 @@ The `CSS` string in `WorkspacePanel` controls sizing. `grid-rows: 1fr 1fr` means
 - Run Claude Code (that stays in Windows Terminal)
 - Stream model responses (waits for full response)
 - Persist output between sessions
-- Auto-refresh on file changes
 - Keep persistent MCP connections (spawns fresh each query)
 
 These could be added, but the goal was minimal viable panel.
