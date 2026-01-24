@@ -22,3 +22,12 @@ env/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Temporary / WIP
+nul
+.obsidian/
+Untitled.base
+architecture/architecture.md
+architecture/hackable-shift-alternative.md
+browser-instrumentation-mcp/
+design-philosophy.md
