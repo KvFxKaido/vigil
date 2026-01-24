@@ -334,11 +334,14 @@ Be VERY brief. If everything looks fine, just say "LGTM".
 If there are issues, list them in 1-2 sentences max.
 Start your response with one of: [SAFE], [WARNING], or [CRITICAL]"""
 
-        response = await client.query_chat(
+        # Stream the review
+        response = ""
+        async for token in client.query_chat_stream(
             prompt=review_prompt,
             context=diff,
             model=selector.selected_model,
-        )
+        ):
+            response += token
 
         self._reviewing = False
 
@@ -419,14 +422,18 @@ Start your response with one of: [SAFE], [WARNING], or [CRITICAL]"""
         else:
             return
 
-        response = await client.query_chat(
+        # Stream response token by token
+        output.clear()
+        full_response = ""
+        async for token in client.query_chat_stream(
             prompt=prompt,
             context=context,
             model=selector.selected_model,
-        )
-        self.last_output = response
-        output.clear()
-        output.write(response)
+        ):
+            full_response += token
+            output.clear()
+            output.write(full_response)
+        self.last_output = full_response
 
     def on_model_panel_shadow_review_complete(self, event: ShadowReviewComplete) -> None:
         """Handle shadow review completion - show in output if critical/warning."""

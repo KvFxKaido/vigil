@@ -130,7 +130,6 @@ The `CSS` string in `WorkspacePanel` controls sizing. `grid-rows: 1fr 1fr` means
 ## What This Doesn't Do
 
 - Run Claude Code (that stays in Windows Terminal)
-- Stream model responses (waits for full response)
 - Persist output between sessions
 - Keep persistent MCP connections (spawns fresh each query)
 

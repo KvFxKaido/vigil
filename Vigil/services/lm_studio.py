@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
+from collections.abc import AsyncIterator
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -195,3 +197,70 @@ class LMStudioClient:
         if isinstance(last_exception, httpx.HTTPStatusError):
             return f"Error: {last_exception.response.status_code} {last_exception.response.reason_phrase}"
         return f"Error: {last_exception}" if last_exception is not None else "Error: Unknown error"
+
+    async def query_chat_stream(
+        self, *, prompt: str, context: str, model: str | None
+    ) -> AsyncIterator[str]:
+        """Stream chat completion tokens as they arrive."""
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a concise assistant helping with git operations. Be brief and direct.",
+            },
+            {"role": "user", "content": f"{prompt}\n\n```\n{context}\n```"},
+        ]
+
+        payload: dict = {
+            "messages": messages,
+            "temperature": 0.3,
+            "max_tokens": 500,
+            "stream": True,
+        }
+
+        if model:
+            payload["model"] = model
+
+        last_exception: Exception | None = None
+        for candidate_base_url in self._candidate_api_roots():
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    url = self._chat_completions_url_for(candidate_base_url)
+                    async with client.stream(
+                        "POST", url, json=payload, headers=self._auth_headers()
+                    ) as response:
+                        if response.status_code in (401, 403):
+                            continue
+                        response.raise_for_status()
+                        self._base_url = candidate_base_url.rstrip("/")
+
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]  # Strip "data: " prefix
+                            if data_str.strip() == "[DONE]":
+                                return
+                            try:
+                                data = json.loads(data_str)
+                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                            except json.JSONDecodeError:
+                                continue
+                        return
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                continue
+            except httpx.ConnectError as e:
+                last_exception = e
+                continue
+            except Exception as e:
+                last_exception = e
+                break
+
+        if isinstance(last_exception, httpx.ConnectError):
+            yield "Error: Can't connect to LM Studio. Is it running?"
+        elif isinstance(last_exception, httpx.HTTPStatusError):
+            yield f"Error: {last_exception.response.status_code} {last_exception.response.reason_phrase}"
+        else:
+            yield f"Error: {last_exception}" if last_exception is not None else "Error: Unknown error"
