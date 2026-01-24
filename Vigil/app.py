@@ -5,8 +5,11 @@ Run in left Windows Terminal pane, Claude Code in right panes
 
 import os
 import subprocess
+import time
+from pathlib import Path
 
 from textual.app import App, ComposeResult
+from textual.message import Message
 from textual.containers import Vertical, Horizontal, VerticalScroll
 from textual.widgets import (
     DirectoryTree, Static, Button, RichLog, Select,
@@ -22,6 +25,53 @@ from services.mcp_client import McpClient
 # --- Configuration ---
 
 STARTING_PATH = "C:/dev/SENTINEL"  # Override with command line arg later
+FILE_POLL_INTERVAL = 2.0  # seconds
+SHADOW_REVIEW_COOLDOWN = 10.0  # seconds between auto-reviews
+
+
+# --- File Watcher ---
+
+class FileWatcher:
+    """Tracks file changes in a directory by comparing mtimes."""
+
+    def __init__(self, root_path: str):
+        self.root_path = Path(root_path)
+        self._last_snapshot: dict[Path, float] = {}
+        self._take_snapshot()
+
+    def _take_snapshot(self) -> dict[Path, float]:
+        """Capture current file mtimes."""
+        snapshot = {}
+        try:
+            for path in self.root_path.rglob("*"):
+                if path.is_file() and ".git" not in path.parts:
+                    try:
+                        snapshot[path] = path.stat().st_mtime
+                    except (OSError, PermissionError):
+                        pass
+        except (OSError, PermissionError):
+            pass
+        return snapshot
+
+    def check_for_changes(self) -> tuple[bool, list[Path], list[Path], list[Path]]:
+        """
+        Check if any files changed since last check.
+        Returns: (changed, added, modified, deleted)
+        """
+        new_snapshot = self._take_snapshot()
+        old_paths = set(self._last_snapshot.keys())
+        new_paths = set(new_snapshot.keys())
+
+        added = list(new_paths - old_paths)
+        deleted = list(old_paths - new_paths)
+        modified = [
+            p for p in (old_paths & new_paths)
+            if self._last_snapshot[p] != new_snapshot[p]
+        ]
+
+        changed = bool(added or deleted or modified)
+        self._last_snapshot = new_snapshot
+        return changed, added, modified, deleted
 
 
 # --- Widgets ---
@@ -176,22 +226,111 @@ class InspectorPanel(Vertical):
 class ModelPanel(Vertical):
     """Bottom-left panel with model controls and output."""
 
+    class ShadowReviewComplete(Message):
+        """Posted when shadow review finishes."""
+        def __init__(self, result: str, status: str) -> None:
+            self.result = result
+            self.status = status  # "safe", "warning", "error"
+            super().__init__()
+
     def __init__(self):
         super().__init__()
         self.last_output = ""
+        self.shadow_enabled = False
+        self._last_diff_hash: int = 0
+        self._reviewing = False
 
     def compose(self) -> ComposeResult:
         yield ModelSelector()
         yield Static("", id="lm-status")
         yield Horizontal(
-            Button("Explain Diff", id="btn-diff", variant="primary"),
-            Button("Summarize Staged", id="btn-staged"),
-            Button("Suggest Commit", id="btn-commit"),
+            Button("Diff", id="btn-diff", variant="primary"),
+            Button("Staged", id="btn-staged"),
+            Button("Commit", id="btn-commit"),
             Button("Ping", id="btn-ping"),
             Button("Copy", id="btn-copy"),
+            Static("│", classes="separator"),
+            Button("Shadow", id="btn-shadow"),
+            Static("[dim]off[/]", id="shadow-status"),
             id="button-row"
         )
         yield RichLog(id="model-output", wrap=True, highlight=True)
+
+    def toggle_shadow(self) -> None:
+        """Toggle shadow review on/off."""
+        self.shadow_enabled = not self.shadow_enabled
+        btn = self.query_one("#btn-shadow", Button)
+        status = self.query_one("#shadow-status", Static)
+        if self.shadow_enabled:
+            btn.variant = "success"
+            status.update("[dim]watching[/]")
+        else:
+            btn.variant = "default"
+            status.update("[dim]off[/]")
+
+    async def run_shadow_review(self) -> None:
+        """Run an automatic review of the current diff."""
+        if not self.shadow_enabled or self._reviewing:
+            return
+
+        selector = self.query_one(ModelSelector)
+        client: LMStudioClient = self.app.lmstudio
+
+        if not client.connected or not selector.selected_model:
+            return
+
+        # Get current diff
+        diff = get_git_diff()
+        if diff in ("(no unstaged changes)", "") or diff.startswith("Error:"):
+            # Try staged changes instead
+            diff = get_git_staged()
+            if diff in ("(nothing staged)", "") or diff.startswith("Error:"):
+                return
+
+        # Check if diff changed since last review
+        diff_hash = hash(diff)
+        if diff_hash == self._last_diff_hash:
+            return
+        self._last_diff_hash = diff_hash
+
+        # Run the review
+        self._reviewing = True
+        status = self.query_one("#shadow-status", Static)
+        status.update("[yellow]Reviewing...[/]")
+
+        review_prompt = """You are a code reviewer. Analyze this diff for:
+1. Security issues (API keys, credentials, injection vulnerabilities)
+2. Obvious bugs or regressions
+3. Debug code that should be removed (console.log, print statements, TODO comments)
+
+Be VERY brief. If everything looks fine, just say "LGTM".
+If there are issues, list them in 1-2 sentences max.
+Start your response with one of: [SAFE], [WARNING], or [CRITICAL]"""
+
+        response = await client.query_chat(
+            prompt=review_prompt,
+            context=diff,
+            model=selector.selected_model,
+        )
+
+        self._reviewing = False
+
+        # Determine status from response
+        if response.startswith("Error:"):
+            review_status = "error"
+            indicator = "[red]ERR[/]"
+        elif "[CRITICAL]" in response.upper():
+            review_status = "critical"
+            indicator = "[red bold]CRITICAL[/]"
+        elif "[WARNING]" in response.upper():
+            review_status = "warning"
+            indicator = "[yellow]WARN[/]"
+        else:
+            review_status = "safe"
+            indicator = "[green]OK[/]"
+
+        status.update(indicator)
+        self.post_message(self.ShadowReviewComplete(response, review_status))
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button clicks."""
@@ -208,6 +347,11 @@ class ModelPanel(Vertical):
                 output.write("[green]Copied to clipboard[/]")
             else:
                 output.write("[yellow]Nothing to copy[/]")
+            return
+
+        # Handle Shadow toggle
+        if event.button.id == "btn-shadow":
+            self.toggle_shadow()
             return
 
         selector = self.query_one(ModelSelector)
@@ -257,18 +401,29 @@ class ModelPanel(Vertical):
         output.clear()
         output.write(response)
 
+    def on_model_panel_shadow_review_complete(self, event: ShadowReviewComplete) -> None:
+        """Handle shadow review completion - show in output if critical/warning."""
+        if event.status in ("critical", "warning"):
+            output = self.query_one("#model-output", RichLog)
+            output.clear()
+            output.write(f"[bold]Shadow Review:[/]\n{event.result}")
+            self.last_output = event.result
+
 
 # --- Main App ---
 
 class WorkspacePanel(App):
     """Left-pane workspace companion."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, watch_path: str = STARTING_PATH, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.watch_path = watch_path
         self.lmstudio = LMStudioClient(
             base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
             api_key=os.environ.get("LMSTUDIO_API_KEY"),
         )
+        self.file_watcher = FileWatcher(watch_path)
+        self._last_shadow_review = 0.0
 
     CSS = """
     Screen {
@@ -362,7 +517,7 @@ class WorkspacePanel(App):
 
     #button-row Button {
         margin-right: 1;
-        min-width: 8;
+        min-width: 4;
         height: 1;
         padding: 0 1;
     }
@@ -472,24 +627,76 @@ class WorkspacePanel(App):
     #resource-content {
         width: 100%;
     }
+
+    /* Shadow review */
+    .separator {
+        width: 1;
+        height: 1;
+        margin: 0 1;
+        color: #333333;
+    }
+
+    #shadow-status {
+        width: auto;
+        min-width: 6;
+        height: 1;
+        margin-left: 1;
+        content-align: left middle;
+        color: #8b949e;
+    }
+
+    #btn-shadow {
+        min-width: 6;
+    }
+
+    #btn-shadow.-success {
+        background: #238636;
+    }
     """
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
+        Binding("s", "toggle_shadow", "Shadow"),
     ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="top-panel"):
             with TabbedContent():
-                yield TabPane("Files", DirectoryTree(STARTING_PATH, id="file-tree"))
+                yield TabPane("Files", DirectoryTree(self.watch_path, id="file-tree"))
                 yield TabPane("Inspector", InspectorPanel())
         yield ModelPanel()
+
+    def on_mount(self) -> None:
+        """Start file polling on mount."""
+        self.set_interval(FILE_POLL_INTERVAL, self._check_for_file_changes)
+
+    async def _check_for_file_changes(self) -> None:
+        """Poll for file changes and refresh tree if needed."""
+        changed, added, modified, deleted = self.file_watcher.check_for_changes()
+
+        if changed:
+            # Refresh the file tree
+            tree = self.query_one("#file-tree", DirectoryTree)
+            tree.reload()
+
+            # Trigger shadow review if enabled and cooldown passed
+            model_panel = self.query_one(ModelPanel)
+            now = time.monotonic()
+            if (model_panel.shadow_enabled and
+                now - self._last_shadow_review >= SHADOW_REVIEW_COOLDOWN):
+                self._last_shadow_review = now
+                await model_panel.run_shadow_review()
 
     def action_refresh(self) -> None:
         """Refresh the file tree."""
         tree = self.query_one("#file-tree", DirectoryTree)
         tree.reload()
+
+    def action_toggle_shadow(self) -> None:
+        """Toggle shadow review via keyboard."""
+        model_panel = self.query_one(ModelPanel)
+        model_panel.toggle_shadow()
 
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         """Open file in default application."""
@@ -502,8 +709,9 @@ if __name__ == "__main__":
     import sys
 
     # Allow passing starting directory as argument
+    watch_path = STARTING_PATH
     if len(sys.argv) > 1:
-        STARTING_PATH = sys.argv[1]
+        watch_path = sys.argv[1]
 
-    app = WorkspacePanel()
+    app = WorkspacePanel(watch_path=watch_path)
     app.run()
