@@ -7,6 +7,10 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from queue import Queue, Empty
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 from textual.app import App, ComposeResult
 from textual.message import Message
@@ -25,52 +29,75 @@ from services.mcp_client import McpClient
 # --- Configuration ---
 
 STARTING_PATH = "C:/dev/SENTINEL"  # Override with command line arg later
-FILE_POLL_INTERVAL = 2.0  # seconds
+FILE_POLL_INTERVAL = 0.5  # seconds - just draining watchdog queue now
 SHADOW_REVIEW_COOLDOWN = 10.0  # seconds between auto-reviews
 
 
 # --- File Watcher ---
 
+class _WatchdogHandler(FileSystemEventHandler):
+    """Collects file system events into a queue."""
+
+    def __init__(self, queue: Queue, root_path: Path):
+        super().__init__()
+        self.queue = queue
+        self.root_path = root_path
+
+    def _should_ignore(self, path: str) -> bool:
+        """Ignore .git and other noise."""
+        return ".git" in path or "__pycache__" in path
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if not event.is_directory and not self._should_ignore(event.src_path):
+            self.queue.put(("created", Path(event.src_path)))
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if not event.is_directory and not self._should_ignore(event.src_path):
+            self.queue.put(("modified", Path(event.src_path)))
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        if not event.is_directory and not self._should_ignore(event.src_path):
+            self.queue.put(("deleted", Path(event.src_path)))
+
+
 class FileWatcher:
-    """Tracks file changes in a directory by comparing mtimes."""
+    """Watches a directory for file changes using watchdog."""
 
     def __init__(self, root_path: str):
         self.root_path = Path(root_path)
-        self._last_snapshot: dict[Path, float] = {}
-        self._take_snapshot()
+        self._queue: Queue = Queue()
+        self._observer = Observer()
+        self._handler = _WatchdogHandler(self._queue, self.root_path)
+        self._observer.schedule(self._handler, str(self.root_path), recursive=True)
+        self._observer.start()
 
-    def _take_snapshot(self) -> dict[Path, float]:
-        """Capture current file mtimes."""
-        snapshot = {}
-        try:
-            for path in self.root_path.rglob("*"):
-                if path.is_file() and ".git" not in path.parts:
-                    try:
-                        snapshot[path] = path.stat().st_mtime
-                    except (OSError, PermissionError):
-                        pass
-        except (OSError, PermissionError):
-            pass
-        return snapshot
+    def stop(self) -> None:
+        """Stop the observer thread."""
+        self._observer.stop()
+        self._observer.join()
 
     def check_for_changes(self) -> tuple[bool, list[Path], list[Path], list[Path]]:
         """
-        Check if any files changed since last check.
+        Drain the event queue and return changes.
         Returns: (changed, added, modified, deleted)
         """
-        new_snapshot = self._take_snapshot()
-        old_paths = set(self._last_snapshot.keys())
-        new_paths = set(new_snapshot.keys())
+        added = []
+        modified = []
+        deleted = []
 
-        added = list(new_paths - old_paths)
-        deleted = list(old_paths - new_paths)
-        modified = [
-            p for p in (old_paths & new_paths)
-            if self._last_snapshot[p] != new_snapshot[p]
-        ]
+        while True:
+            try:
+                event_type, path = self._queue.get_nowait()
+                if event_type == "created":
+                    added.append(path)
+                elif event_type == "modified":
+                    modified.append(path)
+                elif event_type == "deleted":
+                    deleted.append(path)
+            except Empty:
+                break
 
-        changed = bool(added or deleted or modified)
-        self._last_snapshot = new_snapshot
+        changed = bool(added or modified or deleted)
         return changed, added, modified, deleted
 
 
@@ -668,8 +695,12 @@ class WorkspacePanel(App):
         yield ModelPanel()
 
     def on_mount(self) -> None:
-        """Start file polling on mount."""
+        """Start file change polling on mount."""
         self.set_interval(FILE_POLL_INTERVAL, self._check_for_file_changes)
+
+    def on_unmount(self) -> None:
+        """Stop file watcher on exit."""
+        self.file_watcher.stop()
 
     async def _check_for_file_changes(self) -> None:
         """Poll for file changes and refresh tree if needed."""
